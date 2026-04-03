@@ -1,0 +1,791 @@
+###############################################################################
+################## Data Mining and Knowledge Discovery ########################
+###############################################################################
+### Flight Price Analysis And Prediction ####
+### Bessaa Bilal
+
+
+### Packages
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(corrplot)
+library(ranger)
+library(xgboost)
+library(scales)
+library(factoextra)
+library(lubridate)
+library(maps)
+library(ggrepel)
+library(viridis)
+```
+
+```{r}
+df_expedia <- read.csv("df_expedia_prepared.csv")
+```
+
+```{r}
+mape <- function(actual, predicted) {
+  mean(abs((actual - predicted) / actual)) * 100
+}
+```
+
+
+### Analyse Simple du prix
+### Variable cible : totalFare
+```{r}
+ggplot(df_expedia, aes(x = totalFare)) +
+  geom_histogram(bins = 80, fill = "#2196F3", color = "white") +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "Prix des billets",
+       x = "Prix (en $)", y = "Nombre de vols") +
+  theme_minimal()
+```
+
+### Répartition des compagnies aériennes
+```{r}
+df_expedia %>%
+  count(airlineClean, sort = TRUE) %>%
+  ggplot(aes(x = reorder(airlineClean, n), y = n)) +
+  geom_col(fill = "#4CAF50") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Vols par compagnie",
+       x = "", y = "Nombre") +
+  theme_minimal()
+```
+# C très unbalanced
+
+### Répartition des classes de cabine
+```{r}
+df_expedia %>%
+  count(cabinClean) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = reorder(cabinClean, pct), y = pct)) +
+  geom_col(fill = "#FF9800", alpha = 0.85) +
+  coord_flip() +
+  labs(title = "Répartition des classes de cabine",
+       x = NULL, y = "% des vols") +
+  theme_minimal()
+```
+# très unbalanced également
+
+### Distribution des variables numériques clés
+```{r}
+ggplot(df_expedia, aes(x = duration_minutes)) +
+  geom_histogram(bins = 60, fill = "#9C27B0", alpha = 0.8) +
+  labs(title = "Distribution de la durée des vols",
+       x = "Durée (minutes)", y = "Nombre de vols") +
+  theme_minimal()
+
+df_expedia %>%
+  count(nb_escales) %>%
+  ggplot(aes(x = factor(nb_escales), y = n)) +
+  geom_col(fill = "#F44336", alpha = 0.85) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Répartition du nombre d'escales",
+       x = "Nombre d'escales", y = "Nombre de vols") +
+  theme_minimal()
+
+ggplot(df_expedia, aes(x = days_before_flight)) +
+  geom_histogram(bins = 60, fill = "#00BCD4", alpha = 0.8) +
+  labs(title = "Distribution du délai de réservation",
+       x = "Jours avant le vol", y = "Nombre de vols") +
+  theme_minimal()
+```
+
+
+### Prix par compagnie
+```{r}
+df_expedia %>%
+  group_by(airlineClean) %>%
+  summarise(prix_median = median(totalFare)) %>%
+  ggplot(aes(x = reorder(airlineClean, prix_median), y = prix_median)) +
+  geom_col(fill = "#2196F3", alpha = 0.85) +
+  geom_text(aes(label = dollar(prix_median)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(labels = dollar_format(), expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Prix médian par compagnie aérienne",
+       x = NULL, y = "Prix médian ($)") +
+  theme_minimal()
+```
+# On peut distinguer 3 catégories : Low-Cost, Medium et Premium
+
+### Prix par classe de cabine
+```{r}
+ggplot(df_expedia, aes(x = reorder(cabinClean, totalFare, median), y = totalFare)) +
+  geom_boxplot(aes(fill = cabinClean), alpha = 0.75, outlier.alpha = 0.2) +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution des prix par classe de cabine",
+       x = NULL, y = "Prix ($)", fill = NULL) +
+  theme_minimal()
+```
+
+### Prix selon le nombre d'escales
+```{r}
+df_expedia %>%
+  group_by(nb_escales) %>%
+  summarise(
+    prix_median = median(totalFare),
+    prix_moyen  = mean(totalFare),
+    n           = n()
+  ) %>%
+  ggplot(aes(x = factor(nb_escales), y = prix_median)) +
+  geom_col(fill = "#F44336", alpha = 0.85) +
+  geom_text(aes(label = dollar(round(prix_median))), vjust = -0.5, size = 3.5) +
+  scale_y_continuous(labels = dollar_format(), expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Prix médian selon le nombre d'escales",
+       x = "Nombre d'escales", y = "Prix médian ($)") +
+  theme_minimal()
+```
+
+### Prix selon l'anticipation de réservation
+```{r}
+df_expedia %>%
+  mutate(tranche_jours = cut(days_before_flight,
+    breaks = c(0, 7, 14, 30, 60, 90, 120, Inf),
+    labels = c("0-7j", "8-14j", "15-30j", "31-60j", "61-90j", "91-120j", "120j+"),
+    include.lowest = TRUE
+  )) %>%
+  group_by(tranche_jours) %>%
+  summarise(prix_median = median(totalFare)) %>%
+  ggplot(aes(x = tranche_jours, y = prix_median)) +
+  geom_line(aes(group = 1), color = "#2196F3", linewidth = 1.2) +
+  geom_point(color = "#2196F3", size = 3) +
+  geom_text(aes(label = dollar(round(prix_median))), vjust = -0.8, size = 3.2) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Prix médian selon le délai de réservation",
+       x = "Délai avant le vol", y = "Prix médian ($)") +
+  theme_minimal()
+```
+
+# Meilleur entre 15 et 30 jours avant le vol
+
+### Prix selon l'heure de départ
+```{r}
+df_expedia %>%
+  group_by(departure_hour) %>%
+  summarise(prix_median = median(totalFare), n = n()) %>%
+  filter(n > 100) %>%
+  ggplot(aes(x = departure_hour, y = prix_median)) +
+  geom_line(color = "#9C27B0", linewidth = 1.2) +
+  geom_point(color = "#9C27B0", size = 2.5) +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Prix médian selon l'heure de départ",
+       x = "Heure de départ", y = "Prix médian ($)") +
+  theme_minimal()
+```
+# Les vols dans la journée sont les moins chers, les vols de nuit sont plus chers
+
+### Saisonnalité : prix par jour de la semaine
+```{r}
+jours_ordre <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+df_expedia %>%
+  mutate(flight_weekday = factor(flight_weekday, levels = jours_ordre)) %>%
+  group_by(flight_weekday) %>%
+  summarise(prix_median = median(totalFare)) %>%
+  ggplot(aes(x = flight_weekday, y = prix_median)) +
+  geom_col(fill = "#4CAF50", alpha = 0.85) +
+  geom_text(aes(label = dollar(round(prix_median))), vjust = -0.4, size = 3.2) +
+  scale_y_continuous(labels = dollar_format(), expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Prix médian par jour de la semaine",
+       x = NULL, y = "Prix médian ($)") +
+  theme_minimal()
+```
+# Vols moins chers le mardi et mercredi
+
+### Prix selon la satisfaction
+```{r}
+ggplot(df_expedia, aes(x = coalesce_score, y = totalFare)) +
+  stat_summary_bin(fun = mean, bins = 20, geom = "point", color = "#F44336", size = 3) +
+  stat_summary_bin(fun = mean, bins = 20, geom = "line", color = "#F44336") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Prix moyen selon le score de satisfaction",
+       x = "Score de satisfaction", y = "Prix moyen ($)") +
+  theme_minimal()
+```
+# Prix qui augmente avec la note mais beaucoup d'exceptions, intéressant à analyser
+
+### Cartes
+```{r}
+airport_coords <- tibble(
+  code = c("ATL","BOS","CLT","DEN","DFW","DTW","EWR","IAH","JFK","LAX",
+           "LGA","MCO","MDW","MIA","MSP","ORD","PHL","PHX","SEA","SFO",
+           "SLC","TPA","IAD","DCA","BWI","PDX","HOU","DAL","OAK","SJC"),
+  lat  = c(33.64, 42.36, 35.21, 39.86, 32.90, 42.21, 40.69, 29.98, 40.64, 33.94,
+           40.77, 28.43, 41.79, 25.80, 44.88, 41.98, 39.87, 33.44, 47.45, 37.62,
+           40.79, 27.97, 38.94, 38.85, 39.18, 45.59, 29.65, 32.85, 37.72, 37.37),
+  lon  = c(-84.43,-71.01,-80.94,-104.67,-97.04,-83.36,-74.17,-95.34,-73.78,-118.41,
+           -73.87,-81.31,-87.75,-80.29,-93.22,-87.91,-75.24,-112.01,-122.31,-122.37,
+           -111.98,-82.53,-77.46,-77.04,-76.67,-122.60,-95.28,-96.85,-122.22,-121.93)
+)
+
+top_routes <- df_expedia %>%
+  group_by(route, startingAirport, destinationAirport) %>%
+  summarise(prix_median = median(totalFare, na.rm = TRUE), n = n(), .groups = "drop") %>%
+  filter(n >= 500) %>%
+  group_by(startingAirport) %>%
+  slice_max(prix_median, n = 1) %>%
+  ungroup() %>%
+  slice_max(prix_median, n = 20) %>%
+  left_join(airport_coords, by = c("startingAirport" = "code")) %>%
+  rename(departure_lat = lat, departure_lon = lon) %>%
+  left_join(airport_coords, by = c("destinationAirport" = "code")) %>%
+  rename(arrival_lat = lat, arrival_lon = lon)
+
+usa_map <- map_data("state")
+
+ggplot() +
+  geom_polygon(data = usa_map, aes(x = long, y = lat, group = group),
+               fill = "gray95", color = "gray70") +
+  geom_curve(data = top_routes,
+             aes(x = departure_lon, y = departure_lat,
+                 xend = arrival_lon, yend = arrival_lat),
+             color = "#FF5722", linewidth = 0.8, curvature = 0.2,
+             arrow = arrow(length = unit(0.3, "cm"))) +
+  geom_text(data = top_routes,
+            aes(x = (departure_lon + arrival_lon) / 2,
+                y = (departure_lat + arrival_lat) / 2,
+                label = scales::dollar(round(prix_median))),
+            color = "#333333", size = 3, vjust = -0.5) +
+  coord_fixed(1.3, xlim = c(-125, -65), ylim = c(24, 50)) +
+  theme_minimal() +
+  labs(title = "Top routes les plus chères aux USA (1 par aéroport, min. 500 vols)",
+       x = NULL, y = NULL)
+```
+# Les vols allant d'ouest en est sont les plus chers, ce sont les plus longs qui traversent tout le pays.
+# Ils partent tous de San Francisco pour rejoindre les grandes villes, des vols d'affaires
+
+```{r}
+df_expedia %>%
+  group_by(startingAirport) %>%
+  summarise(prix_moyen = mean(totalFare), n = n()) %>%
+  filter(n >= 1000) %>%
+  inner_join(airport_coords, by = c("startingAirport" = "code")) %>%
+  {
+    map_data("state") %>%
+      ggplot() +
+      geom_polygon(aes(x = long, y = lat, group = group),
+                   fill = "#ECEFF1", color = "white", linewidth = 0.3) +
+      geom_point(data = ., aes(x = lon, y = lat, size = n, color = prix_moyen),
+                 alpha = 0.85) +
+      geom_text_repel(data = ., aes(x = lon, y = lat, label = startingAirport),
+                      size = 2.8, max.overlaps = 20) +
+      scale_color_viridis_c(option = "plasma", labels = dollar_format(),
+                             name = "Prix moyen ($)") +
+      scale_size_continuous(range = c(2, 10), labels = comma, name = "Nb vols") +
+      coord_fixed(1.3, xlim = c(-125, -65), ylim = c(24, 50)) +
+      labs(title = "Prix moyen des billets par aéroport de départ") +
+      theme_void() +
+      theme(legend.position = "right",
+            plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+  }
+```
+# Les aéroports de la côte ouest sont les plus chers
+
+
+### Heatmap de corrélations
+```{r}
+vars_numeriques <- df_expedia %>%
+  select(totalFare, duration_minutes, totalTravelDistance, nb_escales,
+         days_before_flight, departure_hour, arrival_hour, coalesce_score,
+         seatsRemaining) %>%
+  cor(use = "complete.obs")
+
+corrplot(vars_numeriques,
+         method      = "color",
+         type        = "upper",
+         tl.cex      = 0.8,
+         addCoef.col = "black",
+         number.cex  = 0.7,
+         col         = colorRampPalette(c("#F44336", "white", "#2196F3"))(200),
+         title       = "Corrélations entre variables numériques",
+         mar         = c(0, 0, 2, 0))
+```
+# Forte corrélation entre la durée et la distance du vol avec le prix du vol
+
+
+### Satisfaction vs prix par compagnie
+```{r}
+df_expedia %>%
+  group_by(airlineClean) %>%
+  summarise(
+    prix_median = median(totalFare),
+    score_moyen = mean(coalesce_score, na.rm = TRUE),
+    n           = n()
+  ) %>%
+  ggplot(aes(x = score_moyen, y = prix_median, size = n, label = airlineClean)) +
+  geom_point(aes(color = airlineClean), alpha = 0.75) +
+  geom_text_repel(size = 3, max.overlaps = 20) +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_size_continuous(range = c(3, 12), labels = comma) +
+  scale_color_viridis_d(guide = "none") +
+  labs(title = "Satisfaction client vs prix médian par compagnie",
+       x = "Score moyen de satisfaction", y = "Prix médian ($)", size = "Nb vols") +
+  theme_minimal()
+```
+# On relève bien 3 catégories différentes de compagnies :
+# Les low-cost avec un Rating score généralement faible sauf JetBlue Airways qui s'en sort bien
+# Les mediums assez répartis
+# Les vols premium avec des Rating score très élevé sauf Boutique Air assez bas.
+# La meilleure compagnie : Alaska Airlines
+# La pire : Frontier Airlines
+
+
+# Clustering
+```{r}
+library(dplyr)
+library(factoextra)
+
+# Résumé des compagnies
+profil_compagnies <- df_expedia %>%
+  group_by(airlineClean) %>%
+  summarise(
+    prix_median      = median(totalFare),
+    duree_moyenne    = mean(duration_minutes),
+    distance_moyenne = mean(totalTravelDistance),
+    .groups          = "drop"
+  ) %>%
+  column_to_rownames("airlineClean")
+
+# Normalisation
+profil_scale <- scale(profil_compagnies)
+
+# Méthode du coude graphique
+fviz_nbclust(profil_scale, kmeans, method = "wss", k.max = 5) +
+  labs(title = "Méthode du coude — nombre optimal de clusters")
+```
+# K optimal : 3
+
+```{r}
+set.seed(42)
+kmeans_result <- kmeans(profil_scale, centers = 3, nstart = 25)
+
+fviz_cluster(kmeans_result, data = profil_scale,
+             palette      = c("#F44336", "#2196F3", "#4CAF50"),
+             labelsize    = 10,
+             geom         = "text",              
+             ellipse.type = "norm",
+             repel        = TRUE,                
+             main         = "Clustering des compagnies selon prix, durée et distance") +
+  theme_minimal() 
+
+clusters_df <- tibble(
+  airlineClean = rownames(profil_compagnies),
+  cluster      = paste0("Cluster ", kmeans_result$cluster)
+)
+
+df_expedia <- df_expedia %>%
+  mutate(airlineClean = as.character(airlineClean)) %>%
+  mutate(cluster = clusters_df$cluster[match(airlineClean, clusters_df$airlineClean)])
+
+profil_clusters <- df_expedia %>%
+  group_by(cluster) %>%
+  summarise(
+    prix_median      = median(totalFare),
+    duree_moyenne    = mean(duration_minutes),
+    distance_moyenne = mean(totalTravelDistance),
+    n_compagnies     = n_distinct(airlineClean),
+    .groups          = "drop"
+  ) %>%
+  arrange(prix_median)
+
+print(profil_clusters)
+```
+
+### Modélisation
+```{r}
+df_model <- df_expedia %>%
+  select(totalFare, airlineClean, cabinClean, isBasicEconomy, isRefundable,
+         nb_escales, days_before_flight, duration_minutes, totalTravelDistance,
+         seatsRemaining, departure_hour, arrival_hour, flight_month,
+         flight_weekday, coalesce_score) %>%
+  drop_na()
+
+cat("Lignes disponibles pour la modélisation :", nrow(df_model), "\n")
+
+set.seed(42)
+idx_train <- sample(seq_len(nrow(df_model)), size = floor(0.8 * nrow(df_model)))
+train <- df_model[ idx_train, ]
+test  <- df_model[-idx_train, ]
+
+cat("Train :", nrow(train), "lignes\n")
+cat("Test  :", nrow(test),  "lignes\n")
+```
+
+### Encodage pour XGBoost
+```{r}
+train_xgb <- train %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  mutate(across(where(is.factor), as.numeric))
+
+test_xgb <- test %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  mutate(across(where(is.factor), as.numeric))
+
+dtrain <- xgb.DMatrix(
+  data  = as.matrix(select(train_xgb, -totalFare)),
+  label = train_xgb$totalFare
+)
+
+dtest <- xgb.DMatrix(
+  data  = as.matrix(select(test_xgb, -totalFare)),
+  label = test_xgb$totalFare
+)
+```
+
+### Baseline — Régression linéaire
+```{r}
+model_lm <- lm(totalFare ~ ., data = train)
+
+pred_lm <- predict(model_lm, newdata = test)
+rmse_lm <- sqrt(mean((test$totalFare - pred_lm)^2))
+r2_lm   <- cor(test$totalFare, pred_lm)^2
+mape_lm <- mape(test$totalFare, pred_lm)
+
+cat("=== Régression Linéaire ===\n")
+cat("RMSE :", round(rmse_lm, 2), "\n")
+cat("R²   :", round(r2_lm, 4), "\n")
+cat("MAPE :", round(mape_lm, 2), "%\n")
+```
+
+### Cross-validation 5-fold — Régression Linéaire
+```{r}
+set.seed(42)
+k <- 5
+
+# Transformer les facteurs en dummies dans un data frame
+df_numeric <- as.data.frame(model.matrix(totalFare ~ ., data = df_model))
+df_numeric$totalFare <- df_model$totalFare
+
+folds <- sample(cut(seq_len(nrow(df_numeric)), breaks = k, labels = FALSE))
+
+cv_rmse <- numeric(k)
+cv_r2   <- numeric(k)
+
+for(i in 1:k){
+  idx_val <- which(folds == i)
+  
+  train_cv <- df_numeric[-idx_val, ]
+  val_cv   <- df_numeric[ idx_val, ]
+  
+  model_cv <- lm(totalFare ~ ., data = train_cv)
+  pred_cv  <- predict(model_cv, newdata = val_cv)
+  
+  cv_rmse[i] <- sqrt(mean((val_cv$totalFare - pred_cv)^2))
+  cv_r2[i]   <- cor(val_cv$totalFare, pred_cv)^2
+}
+
+cat("=== Cross-validation 5-fold — Régression Linéaire ===\n")
+cat("RMSE moyen :", round(mean(cv_rmse), 2), "\n")
+cat("R² moyen   :", round(mean(cv_r2), 4), "\n")
+``
+
+### Random Forest
+```{r}
+set.seed(42)
+model_rf <- ranger(
+  totalFare ~ .,
+  data          = train,
+  num.trees     = 500,
+  mtry          = floor(sqrt(ncol(train) - 1)),
+  min.node.size = 5,
+  importance    = "impurity",
+  num.threads   = 4
+)
+
+pred_rf <- predict(model_rf, data = test)$predictions
+rmse_rf <- sqrt(mean((test$totalFare - pred_rf)^2))
+r2_rf   <- cor(test$totalFare, pred_rf)^2
+mape_rf <- mape(test$totalFare, pred_rf)
+
+cat("=== Random Forest ===\n")
+cat("RMSE :", round(rmse_rf, 2), "\n")
+cat("R²   :", round(r2_rf, 4), "\n")
+cat("MAPE :", round(mape_rf, 2), "%\n")
+```
+
+### XGBoost — Tuning des hyperparamètres
+```{r}
+xgb_grid <- expand.grid(
+  eta       = c(0.05, 0.1),
+  max_depth = c(4, 6),
+  nrounds   = c(100, 200)
+)
+
+resultats_grid <- list()
+
+for (i in 1:nrow(xgb_grid)) {
+  params_i <- list(
+    objective        = "reg:squarederror",
+    eta              = xgb_grid$eta[i],
+    max_depth        = xgb_grid$max_depth[i],
+    subsample        = 0.7,
+    colsample_bytree = 0.7,
+    nthread          = 4
+  )
+
+  cv_i <- xgb.cv(
+    params  = params_i,
+    data    = dtrain,
+    nrounds = xgb_grid$nrounds[i],
+    nfold   = 3,
+    verbose = 0,
+    metrics = "rmse"
+  )
+
+  resultats_grid[[i]] <- tibble(
+    eta       = xgb_grid$eta[i],
+    max_depth = xgb_grid$max_depth[i],
+    nrounds   = xgb_grid$nrounds[i],
+    rmse_cv   = min(cv_i$evaluation_log$test_rmse_mean)
+  )
+
+  cat("eta:", xgb_grid$eta[i],
+      "| max_depth:", xgb_grid$max_depth[i],
+      "| nrounds:", xgb_grid$nrounds[i],
+      "| RMSE:", round(min(cv_i$evaluation_log$test_rmse_mean), 2), "\n")
+}
+
+grid_results <- bind_rows(resultats_grid) %>% arrange(rmse_cv)
+cat("\n=== Meilleurs hyperparamètres ===\n")
+print(head(grid_results, 3))
+```
+
+```{r}
+params_extended <- list(
+  objective        = "reg:squarederror",
+  eta              = 0.1,
+  max_depth        = 6,
+  subsample        = 0.7,
+  colsample_bytree = 0.7,
+  nthread          = 4
+)
+
+cv_extended <- xgb.cv(
+  params                = params_extended,
+  data                  = dtrain,
+  nrounds               = 400,
+  nfold                 = 3,
+  verbose               = 0,
+  metrics               = "rmse",
+  early_stopping_rounds = 20
+)
+
+cat("RMSE optimal (400 rounds) :", round(min(cv_extended$evaluation_log$test_rmse_mean), 2), "\n")
+```
+```{r}
+library(xgboost)
+library(dplyr)
+library(purrr)
+
+set.seed(42)
+
+# 1. Transformer tous les facteurs en dummies
+df_numeric <- as.data.frame(model.matrix(totalFare ~ ., data = df_model))
+df_numeric$totalFare <- df_model$totalFare
+
+# 2. Séparer features et target
+X <- df_numeric %>% select(-totalFare)
+y <- df_numeric$totalFare
+
+# 3. Créer DMatrix pour XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(X), label = y)
+
+# 4. Définir l’espace des hyperparamètres
+param_space <- list(
+  eta = c(0.03, 0.05, 0.07, 0.1),
+  max_depth = 4:7,
+  subsample = seq(0.7, 0.9, 0.05),
+  colsample_bytree = seq(0.7, 0.9, 0.05),
+  min_child_weight = c(1, 3, 5)
+)
+
+# 5. Fonction pour tirer aléatoirement une combinaison
+sample_params <- function() {
+  list(
+    eta = sample(param_space$eta, 1),
+    max_depth = sample(param_space$max_depth, 1),
+    subsample = sample(param_space$subsample, 1),
+    colsample_bytree = sample(param_space$colsample_bytree, 1),
+    min_child_weight = sample(param_space$min_child_weight, 1)
+  )
+}
+
+# 6. Nombre de combinaisons aléatoires à tester
+n_iter <- 50
+
+# 7. Lancer le random search
+results <- map_dfr(1:n_iter, function(i) {
+  params <- sample_params()
+  
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 400,
+    nfold = 5,
+    verbose = 0,
+    metrics = "rmse",
+    early_stopping_rounds = 50
+  )
+  
+  data.frame(
+    eta = params$eta,
+    max_depth = params$max_depth,
+    subsample = params$subsample,
+    colsample_bytree = params$colsample_bytree,
+    min_child_weight = params$min_child_weight,
+    rmse_cv = min(cv$evaluation_log$test_rmse_mean)
+  )
+})
+
+# 8. Trier et afficher les meilleurs résultats
+best_results <- results %>% arrange(rmse_cv)
+cat("\n=== Meilleurs hyperparamètres (Random Search) ===\n")
+print(head(best_results, 10))
+  
+  
+```
+
+
+```{r}
+set.seed(42)
+
+# Préparation des matrices XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(train_xgb %>% select(-totalFare)), label = train_xgb$totalFare)
+dtest  <- xgb.DMatrix(data = as.matrix(test_xgb %>% select(-totalFare)),  label = test_xgb$totalFare)
+
+# Hyperparamètres optimaux issus du Random Search (RMSE minimal)
+params_extended <- list(
+  booster            = "gbtree",
+  eta                = 0.07,
+  max_depth          = 7,
+  subsample          = 0.90,
+  colsample_bytree   = 0.90,
+  min_child_weight   = 3,
+  objective          = "reg:squarederror",
+  eval_metric        = "rmse"
+)
+
+# Entraînement du modèle XGBoost
+model_xgb_tuned <- xgb.train(
+  params  = params_extended,
+  data    = dtrain,
+  nrounds = 400,
+  verbose = 1
+)
+
+# Prédictions sur le jeu de test
+pred_xgb_tuned <- predict(model_xgb_tuned, dtest)
+
+# Évaluation
+rmse_xgb_tuned <- sqrt(mean((test_xgb$totalFare - pred_xgb_tuned)^2))
+r2_xgb_tuned   <- cor(test_xgb$totalFare, pred_xgb_tuned)^2
+mape_xgb       <- mape(test_xgb$totalFare, pred_xgb_tuned)
+
+cat("=== XGBoost final (400 rounds) ===\n")
+cat("RMSE :", round(rmse_xgb_tuned, 2), "\n")
+cat("R²   :", round(r2_xgb_tuned, 4), "\n")
+cat("MAPE :", round(mape_xgb, 2), "%\n")
+```
+
+### Comparaison des modèles
+```{r}
+resultats <- tibble(
+  Modèle = c("Régression Linéaire", "Random Forest", "XGBoost"),
+  RMSE   = c(rmse_lm,       rmse_rf,       rmse_xgb_tuned),
+  R2     = c(r2_lm,         r2_rf,         r2_xgb_tuned),
+  MAPE   = c(mape_lm,       mape_rf,       mape_xgb)
+)
+
+print(resultats)
+```
+
+### Importance des variables — Random Forest
+```{r}
+importance_rf <- model_rf$variable.importance %>%
+  enframe(name = "variable", value = "importance") %>%
+  arrange(desc(importance))
+
+ggplot(importance_rf, aes(x = reorder(variable, importance), y = importance)) +
+  geom_col(fill = "#4CAF50", alpha = 0.85) +
+  coord_flip() +
+  labs(title = "Importance des variables — Random Forest",
+       x = NULL, y = "Importance (impurity)") +
+  theme_minimal()
+```
+
+### Importance des variables — XGBoost
+```{r}
+importance_xgb <- xgb.importance(
+  feature_names = colnames(select(train_xgb, -totalFare)),
+  model         = model_xgb_tuned
+)
+
+xgb.plot.importance(importance_xgb, top_n = 15,
+                    main = "Importance des variables — XGBoost")
+```
+
+### Valeurs réelles vs prédites — Random Forest (meilleur modèle)
+```{r}
+tibble(
+  reel   = test$totalFare,
+  predit = pred_rf
+) %>%
+  ggplot(aes(x = reel, y = predit)) +
+  geom_point(alpha = 0.1, color = "#2196F3") +
+  geom_abline(slope = 1, intercept = 0, color = "#F44336", linewidth = 1) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Valeurs réelles vs prédites — Random Forest (meilleur modèle)",
+       x = "Prix réel ($)", y = "Prix prédit ($)") +
+  theme_minimal()
+```
+
+
+
+```{r}
+df_model_ss <- df_model %>% select(-coalesce_score)
+
+train_ss <- df_model_ss[ idx_train, ]
+test_ss  <- df_model_ss[-idx_train, ]
+
+set.seed(42)
+model_rf_ss <- ranger(
+  totalFare ~ .,
+  data          = train_ss,
+  num.trees     = 100,
+  mtry          = floor(sqrt(ncol(train_ss) - 1)),
+  min.node.size = 5,
+  importance    = "impurity",
+  num.threads   = 4
+)
+
+pred_rf_ss <- predict(model_rf_ss, data = test_ss)$predictions
+rmse_rf_ss <- sqrt(mean((test_ss$totalFare - pred_rf_ss)^2))
+r2_rf_ss   <- cor(test_ss$totalFare, pred_rf_ss)^2
+mape_rf_ss <- mape(test_ss$totalFare, pred_rf_ss)
+
+comparaison_score <- tibble(
+  Modèle = c("Random Forest avec score Reviews", "Random Forest sans score Reviews"),
+  RMSE   = c(rmse_rf,    rmse_rf_ss),
+  R2     = c(r2_rf,      r2_rf_ss),
+  MAPE   = c(mape_rf,    mape_rf_ss)
+)
+
+print(comparaison_score)
+
+ggplot(comparaison_score, aes(x = Modèle, y = RMSE, fill = Modèle)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = round(RMSE, 2)), vjust = -0.4, size = 4) +
+  scale_fill_manual(values = c("#4CAF50", "#F44336")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Impact du score Reviews sur la prédiction du prix",
+       subtitle = "Valeur ajoutée de la fusion des deux datasets",
+       x = NULL, y = "RMSE ($)") +
+  theme_minimal()
+```
+# Aucune amélioration avec le score, logique car la satisfaction du client est une conséquence de la qualité du service et non un facteur.

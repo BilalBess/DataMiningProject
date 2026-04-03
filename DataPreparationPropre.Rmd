@@ -1,0 +1,421 @@
+###############################################################################
+################## Data Mining and Knowledge Discovery ########################
+###############################################################################
+### Flight Price Analysis And Prediction ####
+### Bessaa Bilal
+
+
+### Chargement des packages et des données
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(corrplot)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(scales)
+library(lubridate)
+```
+
+```{r}
+cat("Chargement des données...\n")
+
+df_expedia <- read.csv("itineraries.csv", nrows = 1000000)
+cat("=== EXPEDIA ===\n")
+cat("Lignes :", nrow(df_expedia), "\n")
+cat("Colonnes :", ncol(df_expedia), "\n")
+
+df_reviews <- read.csv("AirlineReviews.csv")
+cat("\n=== REVIEWS ===\n")
+cat("Lignes :", nrow(df_reviews), "\n")
+cat("Colonnes :", ncol(df_reviews), "\n")
+
+cat("Données chargées avec succès ✓\n")
+```
+
+
+### Exploration initiale
+```{r}
+head(df_expedia, 10)
+head(df_reviews, 10)
+```
+
+```{r}
+glimpse(df_expedia)
+glimpse(df_reviews)
+```
+
+```{r}
+print(colnames(df_expedia))
+print(colnames(df_reviews))
+```
+### Beaucoup d'infos inutiles pour notre étude : les détails de l'avion, l'id. A enlever ?
+
+
+### Statistiques descriptives
+```{r}
+# Distribution des prix
+summary(df_expedia$totalFare)
+```
+### Prix entre 24$ et 3810$ donc très répartit, médiane légèrement plus élevé que la moyenne donc des prix plutôt élevé qui pousse la moyenne vers le haut
+
+```{r}
+# Compagnies présentes
+sort(unique(df_expedia$segmentsAirlineName))
+```
+### 98 Compagnies décomptés au total car les vols contenant des escales séparent les compagnies utilisés par des '||' comptant pour différentes compagnies, peut être embêtant pour l'analyse plus tard, à gérer.
+
+```{r}
+# Proportion vols directs vs escales
+table(df_expedia$isNonStop)
+```
+### ≈30% de vols direct pour 70% de vols avec escales. Intéressant de voir s'ils sont forcément moins chers, plus long, moins bien notés ?
+
+```{r}
+# Distribution des notes globales
+summary(df_reviews$OverallScore)
+
+# Nombre de compagnies reviewées
+length(unique(df_reviews$AirlineName))
+
+# Types de voyageurs
+table(df_reviews$TravelType)
+
+# Types de cabines
+table(df_reviews$CabinType)
+```
+### Médiane faible pour moyenne élevée donc quelques scores excellents
+### 25% des avis inférieur à 1
+### Intéressant à analyser par compagnie
+### Majoritairement des vols en Solo et Couples
+### 80% d'Economy class
+
+```{r}
+# Valeurs manquantes
+colSums(is.na(df_expedia))
+colSums(is.na(df_reviews))
+```
+### Pas de valeurs manquantes dans expedia sauf total travel distance -> 6% de valeurs manquantes, variables pas capitales donc okay
+### 4330 variable manquante dans Review, à nettoyer puisque pertinent
+
+
+### Nettoyage Reviews
+```{r}
+cat("Reviews avant nettoyage :", nrow(df_reviews), "\n")
+df_reviews <- df_reviews %>% filter(!is.na(OverallScore))
+cat("Reviews après nettoyage :", nrow(df_reviews), "\n")
+cat("Lignes supprimées :", 129455 - nrow(df_reviews), "\n")
+
+
+### Harmonisation des compagnies aériennes
+### On peut extraire que le premier nom de la correspondance puisque c'est généralement la compagnie principale ou du moins celle que les clients retient ce qui est le plus pertinent pour l'analyse des reviews ensuite.
+
+df_expedia$airlineClean <- sapply(
+  strsplit(df_expedia$segmentsAirlineName, "\\|\\|"),
+  function(x) trimws(x[1])
+)
+
+cat("Compagnies uniques après nettoyage :", length(unique(df_expedia$airlineClean)), "\n")
+print(sort(unique(df_expedia$airlineClean)))
+```
+
+```{r}
+compagnies_expedia <- unique(df_expedia$airlineClean)
+compagnies_reviews <- unique(df_reviews$AirlineName)
+
+cat("Compagnies dans Expedia :", length(compagnies_expedia), "\n")
+cat("Compagnies dans Reviews :", length(compagnies_reviews), "\n")
+
+communes_brut <- intersect(compagnies_expedia, compagnies_reviews)
+cat("\nCompagnies en commun (brut) :", length(communes_brut), "\n")
+print(sort(communes_brut))
+```
+### Il manque 6 compagnies, peut être ont elles des noms différents
+
+```{r}
+manquantes <- setdiff(compagnies_expedia, compagnies_reviews)
+cat("Compagnies Expedia absentes des Reviews :\n")
+print(manquantes)
+
+for (nom in manquantes) {
+  mot_cle <- strsplit(nom, " ")[[1]][1]
+  resultats <- unique(compagnies_reviews[grepl(mot_cle, compagnies_reviews, ignore.case = TRUE)])
+  if (length(resultats) > 0) {
+    cat("'", nom, "' -> trouvé dans Reviews :", resultats, "\n")
+  } else {
+    cat("'", nom, "' -> INTROUVABLE dans Reviews\n")
+  }
+}
+```
+### 3 Correspondances à régler, par contre southern airways express et china southern sont des faux amis. A ne pas confondre
+
+```{r}
+mapping <- c(
+  "Delta"           = "Delta Air Lines",
+  "JetBlue Airways" = "Jetblue Airways",
+  "United"          = "United Airlines"
+)
+df_expedia$airlineClean <- dplyr::recode(df_expedia$airlineClean, !!!mapping)
+
+compagnies_communes <- intersect(unique(df_expedia$airlineClean), unique(df_reviews$AirlineName))
+
+df_expedia <- df_expedia %>% filter(airlineClean %in% compagnies_communes)
+df_reviews <- df_reviews %>% filter(AirlineName %in% compagnies_communes)
+
+cat("Compagnies retenues :", length(compagnies_communes), "\n")
+cat("Lignes Expedia après filtre :", nrow(df_expedia), "\n")
+cat("Lignes Reviews après filtre :", nrow(df_reviews), "\n")
+```
+
+
+### Harmonisation des classes de cabine
+### Comme nous voulons exploiter Review seulement pour ajouter de l'information à Expedia pour savoir si la note influence le prix, toutes les autres infos sont assez dérisoire et couteuse, l'idée serait alors de récupérer la note globale de chaque compagnie. Cependant, récupérer la moyenne des notes de tous les passagers nous fait perdre de l'info sur les notes par classes de vol. Il faudrait d'abord trier cela et vérifier que pour une classe et une compagnie données, on a assez d'avis pour que ce soit représentatif, sinon remplacer par la moyenne globale.
+```{r}
+cat("=== CabinType dans Reviews ===\n")
+print(unique(df_reviews$CabinType))
+
+cat("\n=== segmentsCabinCode dans Expedia ===\n")
+print(unique(df_expedia$segmentsCabinCode))
+```
+
+### Petit problème de noms de classes, facilement traitable :
+### On récup seulement le premier type
+```{r}
+df_expedia <- df_expedia %>%
+  mutate(cabinClean = sapply(strsplit(segmentsCabinCode, "\\|\\|"),
+                              function(x) trimws(x[1])))
+
+mapping_cabin <- c(
+  "coach"         = "Economy Class",
+  "premium coach" = "Premium Economy",
+  "business"      = "Business Class",
+  "first"         = "First Class"
+)
+df_expedia$cabinClean <- dplyr::recode(df_expedia$cabinClean, !!!mapping_cabin)
+
+cat("Classes uniques après mapping :\n")
+print(unique(df_expedia$cabinClean))
+```
+
+
+### Enrichissement depuis Reviews (notes par compagnie/classe)
+### A présent, vérifions le nombre d'avis par compagnie/classe et admettons que la note n'est pas recevable si moins de 15 avis.
+```{r}
+SEUIL <- 15
+
+nb_avis <- df_reviews %>%
+  filter(CabinType != "") %>%
+  group_by(AirlineName, CabinType) %>%
+  summarise(nb_avis = n(), .groups = "drop") %>%
+  arrange(nb_avis)
+
+cat("Combinaisons avec moins de", SEUIL, "avis :\n")
+print(filter(nb_avis, nb_avis < SEUIL))
+```
+
+```{r}
+# Notes par classe (uniquement si nb_avis >= seuil)
+notes_par_classe <- df_reviews %>%
+  filter(CabinType != "") %>%
+  group_by(AirlineName, CabinType) %>%
+  summarise(
+    avg_score_classe = mean(OverallScore, na.rm = TRUE),
+    nb_avis          = n(),
+    .groups          = "drop"
+  ) %>%
+  filter(nb_avis >= SEUIL) %>%
+  select(-nb_avis)
+
+# Notes globales par compagnie (fallback si combinaison sous le seuil ou absente)
+notes_globales <- df_reviews %>%
+  group_by(AirlineName) %>%
+  summarise(avg_score_compagnie = mean(OverallScore, na.rm = TRUE), .groups = "drop")
+
+df_expedia <- df_expedia %>%
+  left_join(notes_par_classe, by = c("airlineClean" = "AirlineName",
+                                      "cabinClean"   = "CabinType")) %>%
+  left_join(notes_globales,   by = c("airlineClean" = "AirlineName")) %>%
+  mutate(
+    avg_score_classe    = round(avg_score_classe, 2),
+    avg_score_compagnie = round(avg_score_compagnie, 2),
+    coalesce_score      = coalesce(avg_score_classe, avg_score_compagnie)
+  )
+
+rm(df_reviews)
+cat("df_reviews supprimé ✓\n")
+
+cat("Lignes avec avg_score_classe NA :", sum(is.na(df_expedia$avg_score_classe)), "\n")
+cat("Lignes avec avg_score_compagnie NA :", sum(is.na(df_expedia$avg_score_compagnie)), "\n")
+```
+
+
+### Feature engineering
+### Actuellement les vols avec escales sont notés plusieurs fois dans le dataset détaillant chaque arrêts. Cela pourrait fausser certaines données, au lieu de ça, gardons seulement le nombre d'escales effectués au total pour supprimer après les vols redondants
+```{r}
+df_expedia <- df_expedia %>%
+  mutate(
+    # Nombre d'escales (extrait avant suppression de segmentsAirlineName)
+    nb_escales = str_count(segmentsAirlineName, "\\|\\|"),
+
+    # Délai entre réservation et vol
+    searchDate         = as.Date(searchDate),
+    flightDate         = as.Date(flightDate),
+    days_before_flight = as.numeric(flightDate - searchDate),
+
+    # Colonne travelDuration compliqué à comprendre au format "PT2H30M", passons le en minutes -> USAGE IA
+    duration_minutes = as.numeric(lubridate::duration(travelDuration)) / 60,
+
+    # Heures de départ et d'arrivée extraites depuis le premier segment
+    departure_hour = as.numeric(substr(
+      sapply(strsplit(segmentsDepartureTimeRaw, "\\|\\|"), `[`, 1), 12, 13
+    )),
+    arrival_hour = as.numeric(substr(
+      sapply(strsplit(segmentsArrivalTimeRaw, "\\|\\|"), `[`, 1), 12, 13
+    )),
+
+    # Mois et jour de la semaine du vol
+    flight_month   = as.numeric(format(flightDate, "%m")),
+    flight_weekday = weekdays(flightDate),
+
+    # Route empruntée
+    route = paste(startingAirport, destinationAirport, sep = " -> ")
+  )
+
+# Vérification des heures
+cat("Échantillon departure_hour :", head(df_expedia$departure_hour, 10), "\n")
+cat("Échantillon arrival_hour   :", head(df_expedia$arrival_hour, 10), "\n")
+```
+
+
+### Suppression des colonnes inutiles
+```{r}
+df_expedia <- df_expedia %>%
+  select(-c(
+    legId,                             # ID inutile
+    fareBasisCode,
+    baseFare,                          # on a déjà totalFare, redondant de savoir sans taxe
+    isNonStop,                         # remplacé par nb_escales
+    travelDuration,                    # remplacé par duration_minutes
+    elapsedDays,                       # redondant avec days_before_flight
+    segmentsAirlineName,               # remplacé par airlineClean
+    segmentsAirlineCode,               # redondant avec airlineClean
+    segmentsCabinCode,                 # remplacé par cabinClean
+    segmentsDepartureTimeRaw,
+    segmentsArrivalTimeRaw,
+    segmentsEquipmentDescription,      # infos trop précises concernant le vol
+    segmentsDurationInSeconds,         # infos trop précises concernant le vol
+    segmentsDistance,                  # infos trop précises concernant le vol
+    segmentsArrivalAirportCode,        # infos trop précises concernant le vol
+    segmentsDepartureAirportCode,      # infos trop précises concernant le vol
+    segmentsDepartureTimeEpochSeconds, # redondant avec TimeRaw
+    segmentsArrivalTimeEpochSeconds,   # redondant avec TimeRaw
+    searchDate,                        # remplacé par days_before_flight
+    flightDate,                        # remplacé par flight_month + flight_weekday
+    avg_score_classe,                  # remplacé par coalesce_score
+    avg_score_compagnie                # remplacé par coalesce_score
+  ))
+```
+
+
+### Imputation, typage et normalisation
+```{r}
+# Imputation de totalTravelDistance par la médiane (6% de NA, variable non capitale)
+mediane_distance <- median(df_expedia$totalTravelDistance, na.rm = TRUE)
+df_expedia <- df_expedia %>%
+  mutate(totalTravelDistance = ifelse(is.na(totalTravelDistance),
+                                       mediane_distance,
+                                       totalTravelDistance))
+cat("NA restants sur totalTravelDistance :", sum(is.na(df_expedia$totalTravelDistance)), "\n")
+```
+
+```{r}
+df_expedia <- df_expedia %>%
+  mutate(
+    # Conversion en facteurs
+    airlineClean       = as.factor(airlineClean),
+    cabinClean         = as.factor(cabinClean),
+    startingAirport    = as.factor(startingAirport),
+    destinationAirport = as.factor(destinationAirport),
+    flight_weekday     = as.factor(flight_weekday),
+    flight_month       = as.factor(flight_month),
+    isBasicEconomy     = as.factor(isBasicEconomy),
+    isRefundable       = as.factor(isRefundable),
+    route              = as.factor(route),
+
+    # Normalisation des variables numériques (as.numeric pour éviter le format matrice)
+    totalFare_scaled          = as.numeric(scale(totalFare)),
+    duration_scaled           = as.numeric(scale(duration_minutes)),
+    distance_scaled           = as.numeric(scale(totalTravelDistance)),
+    days_before_flight_scaled = as.numeric(scale(days_before_flight)),
+    coalesce_score_scaled     = as.numeric(scale(coalesce_score)),
+    departure_hour_scaled     = as.numeric(scale(departure_hour)),
+    arrival_hour_scaled       = as.numeric(scale(arrival_hour)),
+    nb_escales_scaled         = as.numeric(scale(nb_escales))
+  )
+```
+
+
+### Qualité des données
+```{r}
+# Doublons
+cat("Doublons détectés :", sum(duplicated(df_expedia)), "\n")
+df_expedia <- df_expedia %>% distinct()
+cat("Lignes après suppression doublons :", nrow(df_expedia), "\n")
+
+# Cohérence de days_before_flight (pas de valeurs négatives)
+cat("\nVols avec days_before_flight négatif :", sum(df_expedia$days_before_flight < 0, na.rm = TRUE), "\n")
+df_expedia <- df_expedia %>% filter(days_before_flight >= 0)
+cat("Lignes après filtre :", nrow(df_expedia), "\n")
+
+# Outliers sur totalFare (seuil 3*IQR pour conserver les vols Business/First légitimement chers)
+Q1       <- quantile(df_expedia$totalFare, 0.25)
+Q3       <- quantile(df_expedia$totalFare, 0.75)
+IQR_fare <- Q3 - Q1
+borne_basse <- Q1 - 3 * IQR_fare
+borne_haute <- Q3 + 3 * IQR_fare
+
+cat("\n=== Outliers totalFare ===\n")
+cat("Borne basse :", borne_basse, "\n")
+cat("Borne haute :", borne_haute, "\n")
+cat("Outliers détectés :", sum(df_expedia$totalFare < borne_basse |
+                                df_expedia$totalFare > borne_haute), "\n")
+
+df_expedia <- df_expedia %>%
+  filter(totalFare >= borne_basse & totalFare <= borne_haute)
+cat("Lignes après suppression outliers :", nrow(df_expedia), "\n")
+```
+
+
+### Vérification finale
+```{r}
+cat("=== DATASET FINAL ===\n")
+cat("Lignes :", nrow(df_expedia), "\n")
+cat("Colonnes :", ncol(df_expedia), "\n\n")
+colSums(is.na(df_expedia))
+glimpse(df_expedia)
+```
+
+### Enregistrement du dataset Préparé
+```{r}
+write.csv(df_expedia, "df_expedia_prepared.csv", row.names = FALSE)
+```
+
+### Le dataset df_expedia contient maintenant 985 970 lignes et 28 colonnes et est prêt à être analysé. Toutes les variables sont cohérentes, les doublons et valeurs aberrantes sont traités et les colonnes inutiles supprimées. 
+# Les notes des compagnies aériennes ont été intégrées.
+# Les variables numériques ont été normalisées et les variables catégorielles correctement typées.
+
+
+### Objectifs de l’analyse
+
+# L’objectif est de comprendre les déterminants des prix des billets d’avion et de construire des modèles capables de prédire le prix en fonction de différentes caractéristiques. 
+# Nous allons répondre aux questions suivantes :
+
+
+# Quelles compagnies et quelles classes sont les plus chères ?
+# Les compagnies les plus chères sont elles les mieux notées ?
+# Quels sont les routes les plus coûteuse généralement ?
+# Est-ce que réservé plus tôt ces billets joue sur le prix ?
+# Le nombre d’escales influence-t'il le prix ?
+# Y'a t'il un moment (heure,jour,mois) particulier où les vols sont moins chers ?
+# Comment le prix varie-t-il en fonction de la distance parcourue et de la durée du vol ?
+# Les vols longs sont-ils proportionnellement plus chers ?
