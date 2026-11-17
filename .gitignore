@@ -1,0 +1,8 @@
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store
+# datasets (download from Kaggle, see README)
+itineraries.csv
+AirlineReviews.csv
+df_expedia_prepared.csv
